@@ -7,8 +7,11 @@ socket closes early, and the resulting JSON error was reported as
 without ever checking that the response arrived whole.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import email.message
 import json
+import ssl
 import threading
+import urllib.error
 import urllib.request
 
 import pytest
@@ -117,3 +120,47 @@ class TestTruncatedReleaseResponse:
             "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest")
         assert json.loads(payload)["tag_name"] == "v0.21.6"
         assert github["calls"] == 1
+
+
+class TestTransportFailureIsRetried:
+    """A connection cut mid-response is the same fault as a short body."""
+
+    def test_ssl_eof_is_retried(self, github, monkeypatch):
+        """A dropped connection is retried instead of failing the check."""
+        real = urllib.request.urlopen
+        state = {"first": True}
+
+        def drop_first(request, *args, **kwargs):
+            if state["first"]:
+                state["first"] = False
+                raise urllib.error.URLError(
+                    ssl.SSLError("EOF occurred in violation of protocol"))
+            return real(request, *args, **kwargs)
+
+        monkeypatch.setattr(urllib.request, "urlopen", drop_first)
+        payload = source_check._request(
+            "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest")
+        assert json.loads(payload)["tag_name"] == "v0.21.6"
+        assert github["calls"] == 1, "the retry must reach the server"
+
+    def test_spent_rate_limit_is_not_retried(self, monkeypatch):
+        """A 403 that spent the quota must reach the caller at once.
+
+        A token GitHub rejects for another reason (401, or a 403 that is not
+        a spent rate limit) falls back to anonymous, so the request count
+        alone does not tell the two apart -- the rate-limit header does.
+        """
+        calls = []
+
+        def always_limited(request, *args, **kwargs):
+            calls.append(request)
+            headers = email.message.Message()
+            headers["x-ratelimit-remaining"] = "0"
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "rate limited", headers, None)
+
+        monkeypatch.setattr(urllib.request, "urlopen", always_limited)
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            source_check._request("https://api.github.com/x")
+        assert excinfo.value.code == 403
+        assert len(calls) == 1, "a quota decision must not be retried"

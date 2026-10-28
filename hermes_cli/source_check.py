@@ -4,6 +4,7 @@ No fetch, lock repair, or Git writes. Desktop, CLI, and dashboard share this own
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -194,6 +195,20 @@ def _request_with(url: str, accept: str, token: str | None) -> str:
         except _TruncatedResponse as exc:
             last_error = exc
             logger.debug("Truncated response from %s (attempt %d/%d): %s",
+                         url, attempt + 1, _TRUNCATION_ATTEMPTS, exc)
+        except urllib.error.HTTPError:
+            # A 403/429 is a quota decision, not a broken route: it must reach
+            # the caller at once, carrying the rate-limit headers that name
+            # which budget was spent. HTTPError is a URLError, so it is
+            # caught here before the transport failures below.
+            raise
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            # A connection cut mid-response reaches here as an SSL EOF or a
+            # reset, and it is the same fault as a short body: the route
+            # dropped the stream. Retry it rather than failing the check on
+            # the first hiccup.
+            last_error = exc
+            logger.debug("Transport failure for %s (attempt %d/%d): %s",
                          url, attempt + 1, _TRUNCATION_ATTEMPTS, exc)
     raise last_error if last_error is not None else _TruncatedResponse(
         f"{url} returned a truncated response")
