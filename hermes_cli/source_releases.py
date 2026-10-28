@@ -185,6 +185,11 @@ def _describe_release_failure(failure: BaseException) -> str:
 
         # The request that failed, not the configuration: a rejected token retries anonymously.
         return describe_github_failure(failure, authenticated=getattr(failure, "hermes_authenticated", False))
+    # A body that arrived short is a broken download, not a release that does
+    # not exist. Saying "no published stable release" here would send the
+    # reader looking for a missing build instead of at their network.
+    if "truncated" in str(failure).lower():
+        return f"The download from GitHub was cut short and did not arrive whole: {failure}"
     return f"No published stable release could be verified: {failure}"
 
 
@@ -251,13 +256,26 @@ def _read(url: str, *, missing_ok: bool = False) -> str | None:
         "User-Agent": "hermes-update", "Cache-Control": "no-cache",
         "Accept": "application/json, text/html",
     })
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read(2 * 1024 * 1024).decode("utf-8-sig")
-    except urllib.error.HTTPError as exc:
-        if missing_ok and exc.code == 404:
-            return None
-        raise
+    from hermes_cli.source_check import _TRUNCATION_ATTEMPTS, _TruncatedResponse, _read_complete
+
+    last_error: Exception | None = None
+    for _ in range(_TRUNCATION_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                # The pointer is read the same guarded way as every other
+                # release fetch: a short body here would raise a JSON error
+                # that reads as "no release published", naming a missing
+                # build instead of a broken download.
+                return _read_complete(response, url)
+        except urllib.error.HTTPError as exc:
+            if missing_ok and exc.code == 404:
+                return None
+            raise
+        except Exception as exc:  # a short body is worth one more try
+            last_error = exc
+            logger.debug("Could not read %s: %s", url, exc)
+    raise last_error if last_error is not None else _TruncatedResponse(
+        f"{url} returned a truncated response")
 
 
 class _BuildMetadata(HTMLParser):

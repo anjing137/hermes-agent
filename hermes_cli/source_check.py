@@ -25,6 +25,9 @@ UPDATE_AVAILABLE_NO_COUNT = -1
 _UPDATE_CHECK_CACHE_SECONDS = 24 * 3600
 _UPDATE_CHECK_FAILURE_CACHE_SECONDS = 3600
 _RUNTIME_LOOKUP_SECONDS = 8.0
+# A truncated response is a broken route, not a missing release: the same
+# request usually succeeds on a retry.
+_TRUNCATION_ATTEMPTS = 4
 
 
 def _quiet(fn, default=None):
@@ -137,13 +140,63 @@ def _request(url: str, accept: str = "application/vnd.github+json") -> str:
         raise
 
 
+class _TruncatedResponse(ValueError):
+    """The body arrived shorter than the server promised.
+
+    A tunnel, proxy, or a broken route can cut a response stream mid-body.
+    The status line still says 200 and the bytes still start out valid, so
+    nothing but the length check notices.
+
+    It is a ValueError because the release lookups catch ValueError to turn a
+    failed read into a reportable message: a truncated body must be reported
+    as a broken download, never as a release that does not exist.
+    """
+
+
+def _read_complete(response, url: str) -> str:
+    """The response body, but only if it arrived whole.
+
+    ``response.read(n)`` returns a short body *silently* when the socket
+    closes early: no exception, just fewer bytes than the server declared.
+    A truncated body then fails much later as a JSON parse error naming a
+    character offset, which reads like "the release does not exist" instead
+    of "the download broke" (see _resolve_release's caller, which turns any
+    failure into "no published release").
+
+    Compare against ``Content-Length`` and raise while the truth is still
+    known. ``read()`` without a size argument would raise IncompleteRead
+    instead, but it cannot cap the body, so the sized read stays and the
+    length is checked here.
+    """
+    raw = response.read(2 * 1024 * 1024)
+    declared = response.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            expected = int(declared)
+        except (TypeError, ValueError):
+            expected = None
+        if expected is not None and len(raw) != expected:
+            raise _TruncatedResponse(
+                f"{url} returned {len(raw)} of {expected} bytes; the response was truncated")
+    return raw.decode("utf-8-sig").strip()
+
+
 def _request_with(url: str, accept: str, token: str | None) -> str:
     headers = {"Accept": accept, "User-Agent": "hermes-update-check"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return response.read(2 * 1024 * 1024).decode("utf-8-sig").strip()
+    last_error: Exception | None = None
+    for attempt in range(_TRUNCATION_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return _read_complete(response, url)
+        except _TruncatedResponse as exc:
+            last_error = exc
+            logger.debug("Truncated response from %s (attempt %d/%d): %s",
+                         url, attempt + 1, _TRUNCATION_ATTEMPTS, exc)
+    raise last_error if last_error is not None else _TruncatedResponse(
+        f"{url} returned a truncated response")
 
 
 def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
